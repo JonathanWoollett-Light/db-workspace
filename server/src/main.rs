@@ -10,8 +10,9 @@ use std::{
 };
 
 use bytes::{Buf, BytesMut};
+use clap::Parser;
 use indicatif::ProgressBar;
-use log::{info,trace};
+use log::{info, trace};
 use metrics::histogram;
 use rand::{
     distributions::{Alphanumeric, Distribution, Standard},
@@ -28,94 +29,28 @@ use tokio::{
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Decoder, FramedRead};
 
+#[derive(Parser, Debug, Clone)]
+#[clap(author, version, about, long_about = None)]
+pub struct Args {
+    /// When saving, do we:
+    /// - `true`: acquire the read lock, clone, drop the lock, serialize from clone. Faster,
+    ///   requires 2x memory of dataset to be present in system.
+    /// - `false`: acquire the lock, serialize from data, drop the lock. Slower, requires no
+    ///   additional memory.
+    #[clap(long, default_value_t = true)]
+    pub clone_save: bool,
+}
+
 /// The address we spawn the server at.
 const ADDRESS: &str = "127.0.0.1:8080";
 
-/// The module containing our structure for recording metrics.
-mod recorder;
 /// Counter we use to generate unique id's locally for our test dataset.
 static UNIQUE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Database {
-    // User Ids -> User data
-    people: HashMap<Id, Person>,
-    // Post Ids -> Post data
-    posts: HashMap<Id, Post>,
-}
-impl Database {
-    /// Each user has 300 friends.
-    const NUMBER_OF_FRIENDS: usize = 100;
-    /// Each post has 5 likes from among a users friends.
-    const NUMBER_OF_LIKES: usize = 5;
-    /// Each user has 30 posts.
-    const NUMBER_OF_POSTS: usize = 30;
-    /// 1 million users.
-    const SIZE: usize = 1_000_000;
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Person {
-    name: String,
-    friends: HashSet<Id>,
-    posts: Vec<Id>,
-    liked_posts: Vec<Id>,
-}
-impl Person {
-    const NAME_LEN: usize = 3;
-}
-
-impl Distribution<Person> for Standard {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Person {
-        Person {
-            name: rng
-                .sample_iter(&Alphanumeric)
-                .take(Person::NAME_LEN)
-                .map(char::from)
-                .collect(),
-            friends: HashSet::new(),
-            posts: Vec::new(),
-            liked_posts: Vec::new(),
-        }
-    }
-}
-type Id = u64;
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Post {
-    poster: Id,
-    text: String,
-    likes: Vec<Id>,
-    // References/Quotes specific text from a specific post
-    references: Vec<PostReference>,
-}
-const TEXT_LEN: usize = 200;
-impl Post {
-    fn new<R: Rng + ?Sized>(rng: &mut R, poster: Id, likes: Vec<Id>) -> Self {
-        // let rng = rand::thread_rng();
-        Self {
-            poster,
-            text: rng
-                .sample_iter(&Alphanumeric)
-                .take(TEXT_LEN)
-                .map(char::from)
-                .collect(),
-            likes,
-            references: Vec::new(),
-        }
-    }
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PostReference {
-    post: Id,
-    range: std::ops::Range<usize>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Group {
-    name: String,
-    members: Vec<Id>,
-    endorsements: Vec<Id>,
-}
-
 lazy_static::lazy_static! {
+    static ref ARGS: Args = {
+        Args::parse()
+    };
     /// Our metrics recorder
     static ref RECORDER: recorder::MyRecorder = recorder::MyRecorder::new();
     /// Our database
@@ -278,6 +213,88 @@ static FUNCTIONS: [AsyncFn; N as usize] = [
     },
 ];
 
+/// The module containing our structure for recording metrics.
+mod recorder;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Database {
+    // User Ids -> User data
+    people: HashMap<Id, Person>,
+    // Post Ids -> Post data
+    posts: HashMap<Id, Post>,
+}
+impl Database {
+    /// Each user has 300 friends.
+    const NUMBER_OF_FRIENDS: usize = 100;
+    /// Each post has 5 likes from among a users friends.
+    const NUMBER_OF_LIKES: usize = 5;
+    /// Each user has 30 posts.
+    const NUMBER_OF_POSTS: usize = 30;
+    /// 1 million users.
+    const SIZE: usize = 1_000_000;
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Person {
+    name: String,
+    friends: HashSet<Id>,
+    posts: Vec<Id>,
+    liked_posts: Vec<Id>,
+}
+impl Person {
+    const NAME_LEN: usize = 3;
+}
+
+impl Distribution<Person> for Standard {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Person {
+        Person {
+            name: rng
+                .sample_iter(&Alphanumeric)
+                .take(Person::NAME_LEN)
+                .map(char::from)
+                .collect(),
+            friends: HashSet::new(),
+            posts: Vec::new(),
+            liked_posts: Vec::new(),
+        }
+    }
+}
+type Id = u64;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Post {
+    poster: Id,
+    text: String,
+    likes: Vec<Id>,
+    // References/Quotes specific text from a specific post
+    references: Vec<PostReference>,
+}
+const TEXT_LEN: usize = 200;
+impl Post {
+    fn new<R: Rng + ?Sized>(rng: &mut R, poster: Id, likes: Vec<Id>) -> Self {
+        // let rng = rand::thread_rng();
+        Self {
+            poster,
+            text: rng
+                .sample_iter(&Alphanumeric)
+                .take(TEXT_LEN)
+                .map(char::from)
+                .collect(),
+            likes,
+            references: Vec::new(),
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PostReference {
+    post: Id,
+    range: std::ops::Range<usize>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Group {
+    name: String,
+    members: Vec<Id>,
+    endorsements: Vec<Id>,
+}
+
 #[tokio::main]
 async fn main() {
     simple_logger::SimpleLogger::new()
@@ -298,6 +315,7 @@ async fn main() {
 const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 mod my_metrics {
     pub const SAVE_LOCKED: &str = "save: locked";
+    pub const SAVE_UNLOCKED: &str = "save: unlocked";
     pub const SAVE_SERIALIZED: &str = "save: serialized";
     pub const SAVE_SAVED: &str = "save: saved";
 }
@@ -321,7 +339,19 @@ async fn save() {
 
         // Serializes data
         let serialized = {
-            let serialized = bincode::serialize(&*guard).unwrap();
+            let serialized = if ARGS.clone_save {
+                let clone = guard.clone();
+                drop(guard);
+                info!("{}", my_metrics::SAVE_UNLOCKED);
+                histogram!(my_metrics::SAVE_UNLOCKED, now.elapsed());
+                bincode::serialize(&clone).unwrap()
+            } else {
+                let s = bincode::serialize(&*guard).unwrap();
+                drop(guard);
+                info!("{}", my_metrics::SAVE_UNLOCKED);
+                histogram!(my_metrics::SAVE_UNLOCKED, now.elapsed());
+                s
+            };
             info!("{}", my_metrics::SAVE_SERIALIZED);
             histogram!(my_metrics::SAVE_SERIALIZED, now.elapsed());
             serialized
@@ -340,7 +370,7 @@ async fn save() {
         }
         info!("save: finished");
         // Print metrics every save.
-        info!("metrics: {:?}",&*RECORDER);
+        info!("metrics: {:?}", &*RECORDER);
         // Sleep for interval between saves.
         sleep(SAVE_INTERVAL).await;
     }
