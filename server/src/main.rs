@@ -3,7 +3,6 @@
 //! Test server database server covering a social network.
 use std::{
     collections::{HashMap, HashSet},
-    hash::Hash,
     io::Write,
     pin::Pin,
     sync::{atomic::AtomicU64, Arc},
@@ -11,9 +10,8 @@ use std::{
 };
 
 use bytes::{Buf, BytesMut};
-use clap::Parser;
 use indicatif::ProgressBar;
-use log::{info, trace};
+use log::{info,trace};
 use metrics::histogram;
 use rand::{
     distributions::{Alphanumeric, Distribution, Standard},
@@ -33,26 +31,97 @@ use tokio_util::codec::{Decoder, FramedRead};
 /// The address we spawn the server at.
 const ADDRESS: &str = "127.0.0.1:8080";
 
-
-const SAVE_INTERVAL: Duration = Duration::from_secs(30);
-
-const SPLIT_INTERVAL: Duration = Duration::from_secs(30);
-
+/// The module containing our structure for recording metrics.
+mod recorder;
 /// Counter we use to generate unique id's locally for our test dataset.
 static UNIQUE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Database {
+    // User Ids -> User data
+    people: HashMap<Id, Person>,
+    // Post Ids -> Post data
+    posts: HashMap<Id, Post>,
+}
+impl Database {
+    /// Each user has 300 friends.
+    const NUMBER_OF_FRIENDS: usize = 100;
+    /// Each post has 5 likes from among a users friends.
+    const NUMBER_OF_LIKES: usize = 5;
+    /// Each user has 30 posts.
+    const NUMBER_OF_POSTS: usize = 30;
+    /// 1 million users.
+    const SIZE: usize = 1_000_000;
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Person {
+    name: String,
+    friends: HashSet<Id>,
+    posts: Vec<Id>,
+    liked_posts: Vec<Id>,
+}
+impl Person {
+    const NAME_LEN: usize = 3;
+}
+
+impl Distribution<Person> for Standard {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Person {
+        Person {
+            name: rng
+                .sample_iter(&Alphanumeric)
+                .take(Person::NAME_LEN)
+                .map(char::from)
+                .collect(),
+            friends: HashSet::new(),
+            posts: Vec::new(),
+            liked_posts: Vec::new(),
+        }
+    }
+}
+type Id = u64;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Post {
+    poster: Id,
+    text: String,
+    likes: Vec<Id>,
+    // References/Quotes specific text from a specific post
+    references: Vec<PostReference>,
+}
+const TEXT_LEN: usize = 200;
+impl Post {
+    fn new<R: Rng + ?Sized>(rng: &mut R, poster: Id, likes: Vec<Id>) -> Self {
+        // let rng = rand::thread_rng();
+        Self {
+            poster,
+            text: rng
+                .sample_iter(&Alphanumeric)
+                .take(TEXT_LEN)
+                .map(char::from)
+                .collect(),
+            likes,
+            references: Vec::new(),
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PostReference {
+    post: Id,
+    range: std::ops::Range<usize>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Group {
+    name: String,
+    members: Vec<Id>,
+    endorsements: Vec<Id>,
+}
+
 lazy_static::lazy_static! {
-    static ref SPLIT: bool = {
-        let args = Args::parse();
-        info!("args: {:?}", args);
-        args.split
-    };
     /// Our metrics recorder
     static ref RECORDER: recorder::MyRecorder = recorder::MyRecorder::new();
     /// Our database
     ///
     /// For testing we simulate a social network,
-    static ref DATA: Arc<RwLock<Vec<RwLock<Database>>>> = {
+    static ref DATA: Arc<RwLock<Database>> = {
         const STEP: usize = 1000;
         const SAMPLE:usize = 100;
         let now = Instant::now();
@@ -149,153 +218,12 @@ lazy_static::lazy_static! {
             posts
         };
 
-        info!("splitting");
-        
-        let mut data_split = vec![Database {
-            people, posts,
-        }];
-        if *SPLIT {
-            loop {
-                let split_opt = data_split.iter().enumerate().find_map(|(i,f)|if f.should_slit() { Some(i) } else { None });
-                if let Some(split) = split_opt {
-                    let [a,b] = data_split.remove(split).split();
-                    data_split.push(a);
-                    data_split.push(b);
-                } else {
-                    break
-                }
-            }
-        }
-
-        info!("split");
         info!("setup database: {:?}",now.elapsed());
 
-        Arc::new(RwLock::new(data_split.into_iter().map(RwLock::new).collect()))
+        Arc::new(RwLock::new(Database {
+            people, posts,
+        }))
     };
-}
-
-/// The module containing our structure for recording metrics.
-mod recorder;
-
-#[derive(Parser, Debug, Clone)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
-    /// Do we split our database into sections to speed up lock acquisition.
-    #[clap(long, default_value_t = true)]
-    split: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Database {
-    // User Ids -> User data
-    people: HashMap<Id, Person>,
-    // Post Ids -> Post data
-    posts: HashMap<Id, Post>,
-}
-impl Database {
-    /// Each user has 300 friends.
-    const NUMBER_OF_FRIENDS: usize = 100;
-    /// Each post has 5 likes from among a users friends.
-    const NUMBER_OF_LIKES: usize = 5;
-    /// Each user has 30 posts.
-    const NUMBER_OF_POSTS: usize = 30;
-    /// 1 million users.
-    const SIZE: usize = 1_000_000;
-
-    fn should_slit(&self) -> bool {
-        self.people.len() > 100000
-    }
-
-    // Splits `self` into 2 approximately equal sized sections
-    fn split(self) -> [Self; 2] {
-        let [first_people, second_people] = split_hashmap(self.people);
-        let [first_posts, second_posts] = split_hashmap(self.posts);
-        [
-            Self {
-                people: first_people,
-                posts: first_posts,
-            },
-            Self {
-                people: second_people,
-                posts: second_posts,
-            },
-        ]
-    }
-}
-fn split_hashmap<K: Hash + Eq, V>(map: HashMap<K, V>) -> [HashMap<K, V>; 2] {
-    let [mut first, mut second] = [HashMap::new(), HashMap::new()];
-    let len = map.len();
-    let mut iter = map.into_iter();
-    for _ in 0..len / 2 {
-        let (key, value) = iter.next().unwrap();
-        first.insert(key, value);
-    }
-    for _ in len / 2..len {
-        let (key, value) = iter.next().unwrap();
-        second.insert(key, value);
-    }
-    [first, second]
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Person {
-    name: String,
-    friends: HashSet<Id>,
-    posts: Vec<Id>,
-    liked_posts: Vec<Id>,
-}
-impl Person {
-    const NAME_LEN: usize = 3;
-}
-
-impl Distribution<Person> for Standard {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Person {
-        Person {
-            name: rng
-                .sample_iter(&Alphanumeric)
-                .take(Person::NAME_LEN)
-                .map(char::from)
-                .collect(),
-            friends: HashSet::new(),
-            posts: Vec::new(),
-            liked_posts: Vec::new(),
-        }
-    }
-}
-type Id = u64;
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Post {
-    poster: Id,
-    text: String,
-    likes: Vec<Id>,
-    // References/Quotes specific text from a specific post
-    references: Vec<PostReference>,
-}
-const TEXT_LEN: usize = 200;
-impl Post {
-    fn new<R: Rng + ?Sized>(rng: &mut R, poster: Id, likes: Vec<Id>) -> Self {
-        // let rng = rand::thread_rng();
-        Self {
-            poster,
-            text: rng
-                .sample_iter(&Alphanumeric)
-                .take(TEXT_LEN)
-                .map(char::from)
-                .collect(),
-            likes,
-            references: Vec::new(),
-        }
-    }
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PostReference {
-    post: Id,
-    range: std::ops::Range<usize>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Group {
-    name: String,
-    members: Vec<Id>,
-    endorsements: Vec<Id>,
 }
 
 /// Type alias for async function pointer
@@ -360,59 +288,18 @@ async fn main() {
 
     info!("running...");
     tokio::spawn(async { save().await });
-    tokio::spawn(async { split().await });
     loop {
         let listener = TcpListener::bind(ADDRESS).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         tokio::spawn(async { process(stream).await });
     }
 }
-
+/// Internal to snapshot the datastore and save to disk.
+const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 mod my_metrics {
-    pub const SPLIT_LOCKED: &str = "split: locked";
-    pub const SPLIT_SPLIT: &str = "split: split";
-    pub const SAVE_READ_LOCKED: &str = "save: read locked";
+    pub const SAVE_LOCKED: &str = "save: locked";
     pub const SAVE_SERIALIZED: &str = "save: serialized";
     pub const SAVE_SAVED: &str = "save: saved";
-}
-
-// Does split checks and splits db if needed
-async fn split() {
-    loop {
-        info!("split: started");
-        let now = Instant::now();
-
-        // Acquires write lock on all database sections
-        let mut guard = {
-            let guard = loop {
-                if let Ok(g) = DATA.try_write() {
-                    break g;
-                }
-            };
-            info!("{}: {}", my_metrics::SPLIT_LOCKED, guard.len());
-            histogram!(my_metrics::SPLIT_LOCKED, now.elapsed());
-            guard
-        };
-        // Splits database sections until none return `true` for `should_split()`
-        info!("split: splitting");
-        loop {
-            let split_opt = guard.iter().enumerate().find_map(|(i,f)|if f.blocking_read().should_slit() { Some(i) } else { None });
-            if let Some(split) = split_opt {
-                let [a,b] = guard.remove(split).into_inner().split();
-                guard.push(RwLock::new(a));
-                guard.push(RwLock::new(b));
-            } else {
-                break
-            }
-        }
-        info!("{}: {}",my_metrics::SPLIT_SPLIT, guard.len());
-        histogram!(my_metrics::SPLIT_SPLIT, now.elapsed());
-
-        // TODO Is this needed?
-        drop(guard);
-
-        sleep(SPLIT_INTERVAL).await;
-    }
 }
 
 async fn save() {
@@ -427,15 +314,14 @@ async fn save() {
                     break g;
                 }
             };
-            info!("{}", my_metrics::SAVE_READ_LOCKED);
-            histogram!(my_metrics::SAVE_READ_LOCKED, now.elapsed());
+            info!("{}", my_metrics::SAVE_LOCKED);
+            histogram!(my_metrics::SAVE_LOCKED, now.elapsed());
             guard
         };
-        let clones = guard.iter().map(|g|g.blocking_read().clone()).collect::<Vec<_>>();
 
         // Serializes data
         let serialized = {
-            let serialized = bincode::serialize(&clones).unwrap();
+            let serialized = bincode::serialize(&*guard).unwrap();
             info!("{}", my_metrics::SAVE_SERIALIZED);
             histogram!(my_metrics::SAVE_SERIALIZED, now.elapsed());
             serialized
@@ -454,7 +340,7 @@ async fn save() {
         }
         info!("save: finished");
         // Print metrics every save.
-        info!("metrics: {:?}", &*RECORDER);
+        info!("metrics: {:?}",&*RECORDER);
         // Sleep for interval between saves.
         sleep(SAVE_INTERVAL).await;
     }
