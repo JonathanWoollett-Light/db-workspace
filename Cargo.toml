@@ -1,0 +1,2 @@
+[workspace]
+members = ["server","client","gen","destination","destination-server"]
