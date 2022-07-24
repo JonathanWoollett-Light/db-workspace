@@ -12,8 +12,9 @@ use std::{
 use bytes::{Buf, BytesMut};
 use clap::Parser;
 use indicatif::ProgressBar;
-use log::{info, trace};
-use metrics::histogram;
+use log::{info, trace, debug};
+#[cfg(any(metrics = "minimal", metrics = "full"))]
+use metrics::{histogram, increment_counter};
 use rand::{
     distributions::{Alphanumeric, Distribution, Standard},
     seq::IteratorRandom,
@@ -70,7 +71,6 @@ lazy_static::lazy_static! {
         // }
 
         let mut rng = rand::thread_rng();
-
 
         // We generate `SIZE` users.
         let mut people: HashMap<Id,Person> = {
@@ -171,12 +171,20 @@ static FUNCTIONS: [AsyncFn; N as usize] = [
     // Gets users connections 1st, 2nd, 3rd (depending on n where 0=1st, 1=2nd, etc.)
     |bytes: Vec<u8>| {
         Box::pin(async move {
+            // Increments function call count
+            #[cfg(any(metrics = "minimal", metrics = "full"))]
+            increment_counter!("f1");
+
+            // Define input
             #[derive(Deserialize)]
             struct Filter {
                 id: u64,
                 n: u8,
             }
             let filter: Filter = bincode::deserialize(&bytes).unwrap();
+            // Measures time between deserialization of input and serialization of output.
+            #[cfg(metrics = "full")]
+            let now = Instant::now();
 
             let guard = DATA.read().await;
             let user = guard.people.get(&filter.id).unwrap();
@@ -195,19 +203,32 @@ static FUNCTIONS: [AsyncFn; N as usize] = [
                 }
                 connections.push(new_connections);
             }
+            // Records computation time
+            #[cfg(metrics = "full")]
+            histogram!("f1", now.elapsed());
             bincode::serialize(&connections).unwrap()
         })
     },
     // Gets user data by id
     |bytes: Vec<u8>| {
         Box::pin(async move {
+            // Increments function call count
+            #[cfg(any(metrics = "minimal", metrics = "full"))]
+            increment_counter!("f2");
+            // Define input
             #[derive(Deserialize)]
             struct Filter(Id);
             let filter: Filter = bincode::deserialize(&bytes).unwrap();
 
+            // Measures time between deserialization of input and serialization of output.
+            #[cfg(metrics = "full")]
+            let now = Instant::now();
+
             let guard = DATA.read().await;
             let id = guard.people.get(&filter.0).unwrap();
-
+            // Records computation time
+            #[cfg(metrics = "full")]
+            histogram!("f2", now.elapsed());
             bincode::serialize(&id).unwrap()
         })
     },
@@ -225,13 +246,13 @@ struct Database {
 }
 impl Database {
     /// Each user has 300 friends.
-    const NUMBER_OF_FRIENDS: usize = 100;
+    const NUMBER_OF_FRIENDS: usize = 10;
     /// Each post has 5 likes from among a users friends.
     const NUMBER_OF_LIKES: usize = 5;
     /// Each user has 30 posts.
     const NUMBER_OF_POSTS: usize = 30;
     /// 1 million users.
-    const SIZE: usize = 1_000_000;
+    const SIZE: usize = 10_000;
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Person {
@@ -297,17 +318,22 @@ struct Group {
 
 #[tokio::main]
 async fn main() {
-    simple_logger::SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .init()
-        .unwrap();
+    std::env::set_var("METRICS", "minimal");
+    std::env::set_var("RUST_LOG", "info");
+    
+    // Logging can have a huge impact on performance with low complexity high throughput queries.
+    simple_logger::SimpleLogger::new().env().init().unwrap();
+    #[cfg(any(metrics = "minimal", metrics = "full"))]
     metrics::set_recorder(&*RECORDER).unwrap();
+    trace!("testing this>");
 
     info!("running...");
+    lazy_static::initialize(&DATA);
+    let listener = TcpListener::bind(ADDRESS).await.unwrap();
     tokio::spawn(async { save().await });
     loop {
-        let listener = TcpListener::bind(ADDRESS).await.unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
+        let (stream, socket) = listener.accept().await.unwrap();
+        info!("new client: {}", socket);
         tokio::spawn(async { process(stream).await });
     }
 }
@@ -323,6 +349,7 @@ mod my_metrics {
 async fn save() {
     loop {
         info!("save: started");
+        #[cfg(any(metrics = "minimal", metrics = "full"))]
         let now = Instant::now();
 
         // Acquires read lock
@@ -333,6 +360,7 @@ async fn save() {
                 }
             };
             info!("{}", my_metrics::SAVE_LOCKED);
+            #[cfg(any(metrics = "minimal", metrics = "full"))]
             histogram!(my_metrics::SAVE_LOCKED, now.elapsed());
             guard
         };
@@ -343,16 +371,19 @@ async fn save() {
                 let clone = guard.clone();
                 drop(guard);
                 info!("{}", my_metrics::SAVE_UNLOCKED);
+                #[cfg(any(metrics = "minimal", metrics = "full"))]
                 histogram!(my_metrics::SAVE_UNLOCKED, now.elapsed());
                 bincode::serialize(&clone).unwrap()
             } else {
                 let s = bincode::serialize(&*guard).unwrap();
                 drop(guard);
                 info!("{}", my_metrics::SAVE_UNLOCKED);
+                #[cfg(any(metrics = "minimal", metrics = "full"))]
                 histogram!(my_metrics::SAVE_UNLOCKED, now.elapsed());
                 s
             };
             info!("{}", my_metrics::SAVE_SERIALIZED);
+            #[cfg(any(metrics = "minimal", metrics = "full"))]
             histogram!(my_metrics::SAVE_SERIALIZED, now.elapsed());
             serialized
         };
@@ -366,6 +397,7 @@ async fn save() {
             file.write_all(&serialized).unwrap();
 
             info!("{}", my_metrics::SAVE_SAVED);
+            #[cfg(any(metrics = "minimal", metrics = "full"))]
             histogram!(my_metrics::SAVE_SAVED, now.elapsed());
         }
         info!("save: finished");
@@ -385,7 +417,7 @@ async fn process(stream: TcpStream) {
     // We await for a frame to be read from our reader.
     while let Some(next) = reader.next().await {
         // We log the received frame option.
-        info!("received: {:?}", next);
+        trace!("received: {:?}", next);
         // We unwrap the frame (this depends on whether the bytes read from the stream could be
         // converted into our defined frame).
         let (f, x) = next.unwrap();
@@ -396,7 +428,7 @@ async fn process(stream: TcpStream) {
         let res = FUNCTIONS[f as usize](x).await;
         // We write the result to our write stream.
         write_fn(&mut write, res).await;
-        info!("sent");
+        debug!("sent");
     }
 }
 /// A simple function to write a byte slice to our write stream in our format (where the length is
