@@ -1,5 +1,5 @@
 #![warn(clippy::pedantic)]
-use std::{collections::HashSet, time::Instant};
+use std::time::Instant;
 
 use log::{debug, info};
 const ADDRESS: &str = "127.0.0.1:8080";
@@ -11,11 +11,17 @@ use tokio::task;
 
 #[tokio::main]
 async fn main() {
+    // let test = ();
+    // let bytes = bincode::serialize(&test).unwrap();
+    // println!("bytes: {:?}",bytes);
+
+    // panic!("stop");
+
     let now = Instant::now();
     // const SAMPLES: u64 = 100_000;
-    const SAMPLES: u64 = 10_000;
+    const SAMPLES: u64 = 1_000_000;
     const STEP: u64 = 100;
-    const CLIENTS: u64 = 10;
+    const CLIENTS: u64 = 5;
     let multi_bar = MultiProgress::new();
     // multi_bar.set_draw_target(ProgressDrawTarget::stdout());
     let handles = (0..CLIENTS)
@@ -24,9 +30,10 @@ async fn main() {
             task::spawn(async move {
                 let mut client = Client::new(ADDRESS).await;
                 for j in 0..SAMPLES {
-                    client.write(1, UserFilter(0)).await;
-                    let _: Person = client.read().await;
-                    // println!("here?");
+                    client.write(0, ()).await;
+                    // println!("here? 1");
+                    let _: u8 = client.read().await;
+                    // println!("here? 2");
                     if j % STEP == 0 && j != 0 {
                         // println!("here?");
                         // println!("bar: {}",bar.is_hidden());

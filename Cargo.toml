@@ -1,2 +1,3 @@
 [workspace]
-members = ["server","client","gen","destination","destination-server"]
+members = ["client","minimal"]
+# "server","client","gen","destination","destination-server",
